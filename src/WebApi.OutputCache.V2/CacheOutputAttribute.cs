@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Net.Http.Formatting;
 using System.Net.Http.Headers;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -48,6 +49,23 @@ namespace WebApi.OutputCache.V2
         /// </summary>
         public int ClientTimeSpan { get; set; }
 
+        
+        private int? _sharedTimeSpan = null;
+
+        /// <summary>
+        /// Corresponds to CacheControl Shared MaxAge HTTP header (in seconds)
+        /// </summary>
+        public int SharedTimeSpan
+        {
+            get // required for property visibility
+            {
+                if (!_sharedTimeSpan.HasValue)
+                    throw new Exception("should not be called without value set"); 
+                return _sharedTimeSpan.Value;
+            }
+            set { _sharedTimeSpan = value; }
+        }
+
         /// <summary>
         /// Corresponds to CacheControl NoCache HTTP header
         /// </summary>
@@ -62,7 +80,12 @@ namespace WebApi.OutputCache.V2
         /// Class used to generate caching keys
         /// </summary>
         public Type CacheKeyGenerator { get; set; }
-        
+
+        /// <summary>
+        /// If set to something else than an empty string, this value will always be used for the Content-Type header, regardless of content negotiation.
+        /// </summary>
+        public string MediaType { get; set; }
+
         // cache repository
         private IApiOutputCache _webApiCache;
 
@@ -98,11 +121,16 @@ namespace WebApi.OutputCache.V2
 
         protected void ResetCacheTimeQuery()
         {
-            CacheTimeQuery = new ShortTime( ServerTimeSpan, ClientTimeSpan );
+            CacheTimeQuery = new ShortTime( ServerTimeSpan, ClientTimeSpan, _sharedTimeSpan);
         }
 
         protected virtual MediaTypeHeaderValue GetExpectedMediaType(HttpConfiguration config, HttpActionContext actionContext)
         {
+            if (!string.IsNullOrEmpty(MediaType))
+            {
+                return new MediaTypeHeaderValue(MediaType);
+            }
+
             MediaTypeHeaderValue responseMediaType = null;
 
             var negotiator = config.Services.GetService(typeof(IContentNegotiator)) as IContentNegotiator;
@@ -128,7 +156,7 @@ namespace WebApi.OutputCache.V2
                 if (actionContext.Request.Headers.Accept != null)
                 {
                     responseMediaType = actionContext.Request.Headers.Accept.FirstOrDefault();
-                    if (responseMediaType == null || !config.Formatters.Any(x => x.SupportedMediaTypes.Contains(responseMediaType)))
+                    if (responseMediaType == null || !config.Formatters.Any(x => x.SupportedMediaTypes.Any(value => value.MediaType == responseMediaType.MediaType)))
                     {
                         return DefaultMediaType;
                     }
@@ -176,7 +204,17 @@ namespace WebApi.OutputCache.V2
             var val = _webApiCache.Get<byte[]>(cachekey);
             if (val == null) return;
 
-            var contenttype = _webApiCache.Get<MediaTypeHeaderValue>(cachekey + Constants.ContentTypeKey) ?? new MediaTypeHeaderValue(cachekey.Split(new[] { ':' }, 2)[1].Split(';')[0]);
+            var contenttype = _webApiCache.Get<MediaTypeHeaderValue>(cachekey + Constants.ContentTypeKey) ?? responseMediaType;
+            var contentGeneration = _webApiCache.Get<string>(cachekey + Constants.GenerationTimestampKey);
+
+            DateTimeOffset? contentGenerationTimestamp = null;
+            if (contentGeneration != null)
+            {
+                if (DateTimeOffset.TryParse(contentGeneration, out DateTimeOffset parsedContentGenerationTimestamp))
+                {
+                    contentGenerationTimestamp = parsedContentGenerationTimestamp;
+                }
+            };
 
             actionContext.Response = actionContext.Request.CreateResponse();
             actionContext.Response.Content = new ByteArrayContent(val);
@@ -186,7 +224,7 @@ namespace WebApi.OutputCache.V2
             if (responseEtag != null) SetEtag(actionContext.Response,  responseEtag);
 
             var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
-            ApplyCacheHeaders(actionContext.Response, cacheTime);
+            ApplyCacheHeaders(actionContext.Response, cacheTime, contentGenerationTimestamp);
         }
 
         public override async Task OnActionExecutedAsync(HttpActionExecutedContext actionExecutedContext, CancellationToken cancellationToken)
@@ -195,8 +233,9 @@ namespace WebApi.OutputCache.V2
 
             if (!IsCachingAllowed(actionExecutedContext.ActionContext, AnonymousOnly)) return;
 
-            var cacheTime = CacheTimeQuery.Execute(DateTime.Now);
-            if (cacheTime.AbsoluteExpiration > DateTime.Now)
+            var actionExecutionTimestamp = DateTimeOffset.Now;
+            var cacheTime = CacheTimeQuery.Execute(actionExecutionTimestamp.DateTime);
+            if (cacheTime.AbsoluteExpiration > actionExecutionTimestamp)
             {
                 var httpConfig = actionExecutedContext.Request.GetConfiguration();
                 var config = httpConfig.CacheOutputConfiguration();
@@ -233,20 +272,26 @@ namespace WebApi.OutputCache.V2
                         _webApiCache.Add(cachekey + Constants.EtagKey,
                                         etag,
                                         cacheTime.AbsoluteExpiration, baseKey);
+
+
+                        _webApiCache.Add(cachekey + Constants.GenerationTimestampKey,
+                                        actionExecutionTimestamp.ToString(),
+                                        cacheTime.AbsoluteExpiration, baseKey);
                     }
                 }
             }
 
-            ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime);
+            ApplyCacheHeaders(actionExecutedContext.ActionContext.Response, cacheTime, actionExecutionTimestamp);
         }
 
-        protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime)
+        protected virtual void ApplyCacheHeaders(HttpResponseMessage response, CacheTime cacheTime, DateTimeOffset? contentGenerationTimestamp = null)
         {
             if (cacheTime.ClientTimeSpan > TimeSpan.Zero || MustRevalidate || Private)
             {
                 var cachecontrol = new CacheControlHeaderValue
                                        {
                                            MaxAge = cacheTime.ClientTimeSpan,
+                                           SharedMaxAge = cacheTime.SharedTimeSpan,
                                            MustRevalidate = MustRevalidate,
                                            Private = Private
                                        };
@@ -257,6 +302,10 @@ namespace WebApi.OutputCache.V2
             {
                 response.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
                 response.Headers.Add("Pragma", "no-cache");
+            }
+            if ((response.Content != null) && contentGenerationTimestamp.HasValue)
+            {
+                response.Content.Headers.LastModified = contentGenerationTimestamp.Value;
             }
         }
 
