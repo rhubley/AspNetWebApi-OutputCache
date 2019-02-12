@@ -123,7 +123,7 @@ namespace WebApi.OutputCache.V2.Tests
         {
             var client = new HttpClient(_server);
             var result = client.GetAsync(_url + "Get_until25012015_1700").Result;
-            var clientTimeSpanSeconds = new SpecificTime(2017, 01, 25, 17, 0, 0).Execute(DateTime.Now).ClientTimeSpan.TotalSeconds;
+            var clientTimeSpanSeconds = new SpecificTime(2019, 01, 25, 17, 0, 0).Execute(DateTime.Now).ClientTimeSpan.TotalSeconds;
             var resultCacheControlSeconds = ((TimeSpan) result.Headers.CacheControl.MaxAge).TotalSeconds;
             Assert.IsTrue(Math.Round(clientTimeSpanSeconds - resultCacheControlSeconds) == 0);
             Assert.IsFalse(result.Headers.CacheControl.MustRevalidate);
@@ -176,6 +176,22 @@ namespace WebApi.OutputCache.V2.Tests
             var result = client.GetAsync(_url + "Get_private").Result;
 
             Assert.IsTrue(result.Headers.CacheControl.Private);
+        }
+
+        [Test]
+        public void shared_max_age_header_correct()
+        {
+            var client = new HttpClient(_server);
+            var result = client.GetAsync(_url + "Get_c100_s100_sm200").Result;
+            Assert.AreEqual(result.Headers.CacheControl.SharedMaxAge,TimeSpan.FromSeconds(200));
+        }
+
+        [Test]
+        public void shared_max_age_header_not_present()
+        {
+            var client = new HttpClient(_server);
+            var result = client.GetAsync(_url + "Get_c100_s100").Result;
+            Assert.AreEqual(result.Headers.CacheControl.SharedMaxAge, null);
         }
 
         [TestFixtureTearDown]
